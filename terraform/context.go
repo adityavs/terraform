@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/tfdiags"
 
 	"github.com/hashicorp/go-multierror"
@@ -55,7 +56,7 @@ type ContextOpts struct {
 	Destroy            bool
 	Diff               *Diff
 	Hooks              []Hook
-	Module             *module.Tree
+	Config             *configs.Config
 	Parallelism        int
 	State              *State
 	StateFutureAllowed bool
@@ -97,7 +98,7 @@ type Context struct {
 	diffLock   sync.RWMutex
 	hooks      []Hook
 	meta       *ContextMeta
-	module     *module.Tree
+	config     *configs.Config
 	sh         *stopHook
 	shadow     bool
 	state      *State
@@ -208,7 +209,7 @@ func NewContext(opts *ContextOpts) (*Context, error) {
 		diff:      diff,
 		hooks:     hooks,
 		meta:      opts.Meta,
-		module:    opts.Module,
+		config:    opts.Config,
 		shadow:    opts.Shadow,
 		state:     state,
 		targets:   opts.Targets,

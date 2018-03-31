@@ -63,11 +63,13 @@ func (b *Local) context(op *backend.Operation) (*terraform.Context, state.State,
 		opts.Variables = op.Variables
 	}
 
-	// FIXME: Configuration is temporarily stubbed out here to artificially
-	// create a stopping point in our work to switch to the new config loader.
-	// This means no backend-provided Terraform operations will actually work.
-	// This will be addressed in a subsequent commit.
-	opts.Module = nil
+	// Load the configuration using the caller-provided configuration loader.
+	config, configDiags := op.ConfigLoader.LoadConfig(op.ConfigDir)
+	diags = diags.Append(configDiags)
+	if configDiags.HasErrors() {
+		return nil, nil, diags
+	}
+	opts.Config = config
 
 	// Load our state
 	// By the time we get here, the backend creation code in "command" took
