@@ -2,10 +2,11 @@ package command
 
 import (
 	"fmt"
-	"sort"
+	"path/filepath"
 
-	"github.com/hashicorp/terraform/moduledeps"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/configs"
+	"github.com/hashicorp/terraform/internal/getproviders"
+	"github.com/hashicorp/terraform/tfdiags"
 	"github.com/xlab/treeprint"
 )
 
@@ -24,11 +25,11 @@ func (c *ProvidersCommand) Synopsis() string {
 }
 
 func (c *ProvidersCommand) Run(args []string) int {
-	c.Meta.process(args, false)
-
-	cmdFlags := c.Meta.flagSet("providers")
+	args = c.Meta.process(args)
+	cmdFlags := c.Meta.defaultFlagSet("providers")
 	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
 	if err := cmdFlags.Parse(args); err != nil {
+		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
 		return 1
 	}
 
@@ -38,85 +39,105 @@ func (c *ProvidersCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Load the config
-	root, diags := c.Module(configPath)
-	if diags.HasErrors() {
+	var diags tfdiags.Diagnostics
+
+	empty, err := configs.IsEmptyDir(configPath)
+	if err != nil {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Error validating configuration directory",
+			fmt.Sprintf("Terraform encountered an unexpected error while verifying that the given configuration directory is valid: %s.", err),
+		))
 		c.showDiagnostics(diags)
 		return 1
 	}
-	if root == nil {
-		c.Ui.Error(fmt.Sprintf(
-			"No configuration files found in the directory: %s\n\n"+
-				"This command requires configuration to run.",
-			configPath))
+	if empty {
+		absPath, err := filepath.Abs(configPath)
+		if err != nil {
+			absPath = configPath
+		}
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"No configuration files",
+			fmt.Sprintf("The directory %s contains no Terraform configuration files.", absPath),
+		))
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	config, configDiags := c.loadConfig(configPath)
+	diags = diags.Append(configDiags)
+	if configDiags.HasErrors() {
+		c.showDiagnostics(diags)
 		return 1
 	}
 
 	// Load the backend
-	b, err := c.Backend(&BackendOpts{
-		Config: root.Config(),
+	b, backendDiags := c.Backend(&BackendOpts{
+		Config: config.Module.Backend,
 	})
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load backend: %s", err))
+	diags = diags.Append(backendDiags)
+	if backendDiags.HasErrors() {
+		c.showDiagnostics(diags)
 		return 1
 	}
 
 	// Get the state
 	env := c.Workspace()
-	state, err := b.State(env)
+	s, err := b.StateMgr(env)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
 		return 1
 	}
-	if err := state.RefreshState(); err != nil {
+	if err := s.RefreshState(); err != nil {
 		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
 		return 1
 	}
 
-	s := state.State()
+	reqs, reqDiags := config.ProviderRequirementsByModule()
+	diags = diags.Append(reqDiags)
+	if diags.HasErrors() {
+		c.showDiagnostics(diags)
+		return 1
+	}
 
-	depTree := terraform.ModuleTreeDependencies(root, s)
-	depTree.SortDescendents()
+	state := s.State()
+	var stateReqs getproviders.Requirements
+	if state != nil {
+		stateReqs = state.ProviderRequirements()
+	}
 
 	printRoot := treeprint.New()
-	providersCommandPopulateTreeNode(printRoot, depTree)
+	c.populateTreeNode(printRoot, reqs)
 
+	c.Ui.Output("\nProviders required by configuration:")
 	c.Ui.Output(printRoot.String())
+
+	if len(stateReqs) > 0 {
+		c.Ui.Output("Providers required by state:\n")
+		for fqn := range stateReqs {
+			c.Ui.Output(fmt.Sprintf("    provider[%s]\n", fqn.String()))
+		}
+	}
 
 	c.showDiagnostics(diags)
 	if diags.HasErrors() {
 		return 1
 	}
-
 	return 0
 }
 
-func providersCommandPopulateTreeNode(node treeprint.Tree, deps *moduledeps.Module) {
-	names := make([]string, 0, len(deps.Providers))
-	for name := range deps.Providers {
-		names = append(names, string(name))
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		dep := deps.Providers[moduledeps.ProviderInstance(name)]
-		versionsStr := dep.Constraints.String()
+func (c *ProvidersCommand) populateTreeNode(tree treeprint.Tree, node *configs.ModuleRequirements) {
+	for fqn, dep := range node.Requirements {
+		versionsStr := getproviders.VersionConstraintsString(dep)
 		if versionsStr != "" {
 			versionsStr = " " + versionsStr
 		}
-		var reasonStr string
-		switch dep.Reason {
-		case moduledeps.ProviderDependencyInherited:
-			reasonStr = " (inherited)"
-		case moduledeps.ProviderDependencyFromState:
-			reasonStr = " (from state)"
-		}
-		node.AddNode(fmt.Sprintf("provider.%s%s%s", name, versionsStr, reasonStr))
+		tree.AddNode(fmt.Sprintf("provider[%s]%s", fqn.String(), versionsStr))
 	}
-
-	for _, child := range deps.Children {
-		childNode := node.AddBranch(fmt.Sprintf("module.%s", child.Name))
-		providersCommandPopulateTreeNode(childNode, child)
+	for name, childNode := range node.Children {
+		branch := tree.AddBranch(fmt.Sprintf("module.%s", name))
+		c.populateTreeNode(branch, childNode)
 	}
 }
 
@@ -129,5 +150,4 @@ Usage: terraform providers [dir]
   This provides an overview of all of the provider requirements across all
   referenced modules, as an aid to understanding why particular provider
   plugins are needed and why particular versions are selected.
-
 `

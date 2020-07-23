@@ -3,6 +3,10 @@
 Are you a core maintainer of Terraform? Great! Here's a few notes
 to help you get comfortable when working on the project.
 
+This documentation is somewhat outdated since it still includes provider-related
+information even though providers are now developed in their own separate
+codebases, but the general information is still valid.
+
 ## Expectations
 
 We value the time you spend on the project and as such your maintainer status
@@ -13,7 +17,7 @@ doesn't imply any obligations to do any specific work.
 These apply to all contributors, but maintainers should lead by examples! :wink:
 
  - for `provider/*` PRs it's useful to attach test results & advise on how to run the relevant tests
- - for `bug`fixes it's useful to attach repro case, ideally in a form of a test
+ - for `bug` fixes it's useful to attach repro case, ideally in a form of a test
 
 ### PRs/issues from others
 

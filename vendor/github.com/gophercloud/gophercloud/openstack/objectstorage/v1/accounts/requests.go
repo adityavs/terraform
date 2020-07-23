@@ -22,7 +22,7 @@ func (opts GetOpts) ToAccountGetMap() (map[string]string, error) {
 // Get is a function that retrieves an account's metadata. To extract just the
 // custom metadata, call the ExtractMetadata method on the GetResult. To extract
 // all the headers that are returned (including the metadata), call the
-// ExtractHeader method on the GetResult.
+// Extract method on the GetResult.
 func Get(c *gophercloud.ServiceClient, opts GetOptsBuilder) (r GetResult) {
 	h := make(map[string]string)
 	if opts != nil {
@@ -35,14 +35,11 @@ func Get(c *gophercloud.ServiceClient, opts GetOptsBuilder) (r GetResult) {
 			h[k] = v
 		}
 	}
-	resp, err := c.Request("HEAD", getURL(c), &gophercloud.RequestOpts{
+	resp, err := c.Head(getURL(c), &gophercloud.RequestOpts{
 		MoreHeaders: h,
 		OkCodes:     []int{204},
 	})
-	if resp != nil {
-		r.Header = resp.Header
-	}
-	r.Err = err
+	_, r.Header, r.Err = gophercloud.ParseResponse(resp, err)
 	return
 }
 
@@ -92,9 +89,6 @@ func Update(c *gophercloud.ServiceClient, opts UpdateOptsBuilder) (r UpdateResul
 		MoreHeaders: h,
 		OkCodes:     []int{201, 202, 204},
 	})
-	if resp != nil {
-		r.Header = resp.Header
-	}
-	r.Err = err
+	_, r.Header, r.Err = gophercloud.ParseResponse(resp, err)
 	return
 }

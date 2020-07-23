@@ -12,12 +12,18 @@ The `chef` provisioner installs, configures and runs the Chef Client on a remote
 resource. The `chef` provisioner supports both `ssh` and `winrm` type
 [connections](/docs/provisioners/connection.html).
 
+-> **Note:** Provisioners should only be used as a last resort. For most
+common situations there are better alternatives. For more information, see
+[the main Provisioners page](./).
+
 ## Requirements
 
 The `chef` provisioner has some prerequisites for specific connection types:
 
-- For `ssh` type connections, `cURL` must be available on the remote host.
-- For `winrm` connections, `PowerShell 2.0` must be available on the remote host.
+* For `ssh` type connections, `cURL` must be available on the remote host.
+* For `winrm` connections, `PowerShell 2.0` must be available on the remote host.
+
+[Chef end user license agreement](https://www.chef.io/end-user-license-agreement/) must be accepted by setting `chef_license` to `accept` in `client_options` argument unless you are installing an old version of Chef client.
 
 Without these prerequisites, your provisioning execution will fail.
 
@@ -28,7 +34,7 @@ resource "aws_instance" "web" {
   # ...
 
   provisioner "chef" {
-    attributes_json = <<-EOF
+    attributes_json = <<EOF
       {
         "key": "value",
         "app": {
@@ -43,6 +49,7 @@ resource "aws_instance" "web" {
     EOF
 
     environment     = "_default"
+    client_options  = ["chef_license 'accept'"]
     run_list        = ["cookbook::recipe"]
     node_name       = "webserver1"
     secret_key      = "${file("../encrypted_data_bag_secret")}"
@@ -50,7 +57,7 @@ resource "aws_instance" "web" {
     recreate_client = true
     user_name       = "bork"
     user_key        = "${file("../bork.pem")}"
-    version         = "12.4.1"
+    version         = "15.10.13"
     # If you have a self signed cert on your chef server change this to :verify_none
     ssl_verify_mode = ":verify_peer"
   }
@@ -62,8 +69,8 @@ resource "aws_instance" "web" {
 The following arguments are supported:
 
 * `attributes_json (string)` - (Optional) A raw JSON string with initial node attributes
-  for the new node. These can also be loaded from a file on disk using the [`file()`
-  interpolation function](/docs/configuration/interpolation.html#file_path_).
+  for the new node. These can also be loaded from a file on disk using
+  [the `file` function](/docs/configuration/functions/file.html).
 
 * `channel (string)` - (Optional) The Chef Client release channel to install from. If not
   set, the `stable` channel will be used.
@@ -102,6 +109,9 @@ The following arguments are supported:
 
 * `https_proxy (string)` - (Optional) The proxy server for Chef Client HTTPS connections.
 
+* `max_retries (integer)` - (Optional) The number of times to retry the provisioning process
+  after receiving an exit code in the `retry_on_error` list. Defaults to `0`
+
 * `named_run_list (string)` - (Optional) The name of an alternate run-list to invoke during the
   initial Chef Client run. The run-list must already exist in the Policyfile that defines
   `policy_name`. Only applies when `use_policyfile` is `true`.
@@ -124,6 +134,11 @@ The following arguments are supported:
 * `recreate_client (boolean)` - (Optional) If `true`, first delete any existing Chef Node and
   Client before registering the new Chef Client.
 
+* `retry_on_error (array)` - (Optional) The error codes upon which Terraform should
+  gracefully retry the provisioning process. Intended for use with
+  [Chef RFC062 codes](https://github.com/chef-boneyard/chef-rfc/blob/master/rfc062-exit-status.md).
+  (Defaults to `[35, 37, 213]`)
+
 * `run_list (array)` - (Optional) A list with recipes that will be invoked during the initial
   Chef Client run. The run-list will also be saved to the Chef Server after a successful
   initial run. Required if `use_policyfile` is `false`; ignored when `use_policyfile` is `true`
@@ -131,8 +146,8 @@ The following arguments are supported:
 
 * `secret_key (string)` - (Optional) The contents of the secret key that is used
   by the Chef Client to decrypt data bags on the Chef Server. The key will be uploaded to the remote
-  machine. This can also be loaded from a file on disk using the [`file()` interpolation
-  function](/docs/configuration/interpolation.html#file_path_).
+  machine. This can also be loaded from a file on disk using
+  [the `file` function](/docs/configuration/functions/file.html).
 
 * `server_url (string)` - (Required) The URL to the Chef server. This includes the path to
   the organization. See the example.
@@ -153,12 +168,16 @@ The following arguments are supported:
   the new Chef Client and optionally configure Chef Vaults.
 
 * `user_key (string)` - (Required) The contents of the user key that will be used to
-  authenticate with the Chef Server. This can also be loaded from a file on disk using the [`file()`
-  interpolation function](/docs/configuration/interpolation.html#file_path_).
+  authenticate with the Chef Server. This can also be loaded from a file on disk using
+  [the `file` function](/docs/configuration/functions/file.html).
 
 * `vault_json (string)` - (Optional) A raw JSON string with Chef Vaults and Items to which the new node
-  should have access. These can also be loaded from a file on disk using the
-  [`file()` interpolation function](/docs/configuration/interpolation.html#file_path_).
+  should have access. These can also be loaded from a file on disk using
+  [the `file` function](/docs/configuration/functions/file.html).
 
 * `version (string)` - (Optional) The Chef Client version to install on the remote machine.
   If not set, the latest available version will be installed.
+
+* `wait_for_retry (integer)` - (Optional) - Amount of time in seconds to wait before
+  retrying the provisionining process after receiving an exit code in the `retry_on_error`
+  list.  Defaults to `30`.

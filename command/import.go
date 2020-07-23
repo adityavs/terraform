@@ -1,16 +1,18 @@
 package command
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
-	"github.com/hashicorp/hcl2/hcl"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 
+	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/backend"
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 )
@@ -30,18 +32,14 @@ func (c *ImportCommand) Run(args []string) int {
 	}
 
 	var configPath string
-	args, err = c.Meta.process(args, true)
-	if err != nil {
-		return 1
-	}
+	args = c.Meta.process(args)
 
-	cmdFlags := c.Meta.flagSet("import")
-	cmdFlags.IntVar(&c.Meta.parallelism, "parallelism", 0, "parallelism")
-	cmdFlags.StringVar(&c.Meta.statePath, "state", DefaultStateFilename, "path")
+	cmdFlags := c.Meta.extendedFlagSet("import")
+	cmdFlags.IntVar(&c.Meta.parallelism, "parallelism", DefaultParallelism, "parallelism")
+	cmdFlags.StringVar(&c.Meta.statePath, "state", "", "path")
 	cmdFlags.StringVar(&c.Meta.stateOutPath, "state-out", "", "path")
 	cmdFlags.StringVar(&c.Meta.backupPath, "backup", "", "path")
 	cmdFlags.StringVar(&configPath, "config", pwd, "path")
-	cmdFlags.StringVar(&c.Meta.provider, "provider", "", "provider")
 	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock state")
 	cmdFlags.DurationVar(&c.Meta.stateLockTimeout, "lock-timeout", 0, "lock timeout")
 	cmdFlags.BoolVar(&c.Meta.allowMissingConfig, "allow-missing-config", false, "allow missing config")
@@ -57,57 +55,62 @@ func (c *ImportCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Validate the provided resource address for syntax
-	addr, err := terraform.ParseResourceAddress(args[0])
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf(importCommandInvalidAddressFmt, err))
-		return 1
-	}
-	if !addr.HasResourceSpec() {
-		// module.foo target isn't allowed for import
-		c.Ui.Error(importCommandMissingResourceSpecMsg)
-		return 1
-	}
-	if addr.Mode != config.ManagedResourceMode {
-		// can't import to a data resource address
-		c.Ui.Error(importCommandResourceModeMsg)
-		return 1
-	}
-
 	var diags tfdiags.Diagnostics
 
-	// Load the module
-	var mod *module.Tree
-	if configPath != "" {
-		if empty, _ := config.IsEmptyDir(configPath); empty {
-			diags = diags.Append(&hcl.Diagnostic{
-				Severity: hcl.DiagError,
-				Summary:  "No Terraform configuration files",
-				Detail: fmt.Sprintf(
-					"The directory %s does not contain any Terraform configuration files (.tf or .tf.json). To specify a different configuration directory, use the -config=\"...\" command line option.",
-					configPath,
-				),
-			})
-			c.showDiagnostics(diags)
-			return 1
-		}
+	// Parse the provided resource address.
+	traversalSrc := []byte(args[0])
+	traversal, travDiags := hclsyntax.ParseTraversalAbs(traversalSrc, "<import-address>", hcl.Pos{Line: 1, Column: 1})
+	diags = diags.Append(travDiags)
+	if travDiags.HasErrors() {
+		c.registerSynthConfigSource("<import-address>", traversalSrc) // so we can include a source snippet
+		c.showDiagnostics(diags)
+		c.Ui.Info(importCommandInvalidAddressReference)
+		return 1
+	}
+	addr, addrDiags := addrs.ParseAbsResourceInstance(traversal)
+	diags = diags.Append(addrDiags)
+	if addrDiags.HasErrors() {
+		c.registerSynthConfigSource("<import-address>", traversalSrc) // so we can include a source snippet
+		c.showDiagnostics(diags)
+		c.Ui.Info(importCommandInvalidAddressReference)
+		return 1
+	}
 
-		var modDiags tfdiags.Diagnostics
-		mod, modDiags = c.Module(configPath)
-		diags = diags.Append(modDiags)
-		if modDiags.HasErrors() {
-			c.showDiagnostics(diags)
-			return 1
-		}
+	if addr.Resource.Resource.Mode != addrs.ManagedResourceMode {
+		diags = diags.Append(errors.New("A managed resource address is required. Importing into a data resource is not allowed."))
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	if !c.dirIsConfigPath(configPath) {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "No Terraform configuration files",
+			Detail: fmt.Sprintf(
+				"The directory %s does not contain any Terraform configuration files (.tf or .tf.json). To specify a different configuration directory, use the -config=\"...\" command line option.",
+				configPath,
+			),
+		})
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	// Load the full config, so we can verify that the target resource is
+	// already configured.
+	config, configDiags := c.loadConfig(configPath)
+	diags = diags.Append(configDiags)
+	if configDiags.HasErrors() {
+		c.showDiagnostics(diags)
+		return 1
 	}
 
 	// Verify that the given address points to something that exists in config.
 	// This is to reduce the risk that a typo in the resource address will
 	// import something that Terraform will want to immediately destroy on
 	// the next plan, and generally acts as a reassurance of user intent.
-	targetMod := mod.Child(addr.Path)
-	if targetMod == nil {
-		modulePath := addr.WholeModuleAddress().String()
+	targetConfig := config.DescendentForInstance(addr.Module)
+	if targetConfig == nil {
+		modulePath := addr.Module.String()
 		diags = diags.Append(&hcl.Diagnostic{
 			Severity: hcl.DiagError,
 			Summary:  "Import to non-existent module",
@@ -119,16 +122,18 @@ func (c *ImportCommand) Run(args []string) int {
 		c.showDiagnostics(diags)
 		return 1
 	}
-	rcs := targetMod.Config().Resources
-	var rc *config.Resource
+	targetMod := targetConfig.Module
+	rcs := targetMod.ManagedResources
+	var rc *configs.Resource
+	resourceRelAddr := addr.Resource.Resource
 	for _, thisRc := range rcs {
-		if addr.MatchesConfig(targetMod, thisRc) {
+		if resourceRelAddr.Type == thisRc.Type && resourceRelAddr.Name == thisRc.Name {
 			rc = thisRc
 			break
 		}
 	}
 	if !c.Meta.allowMissingConfig && rc == nil {
-		modulePath := addr.WholeModuleAddress().String()
+		modulePath := addr.Module.String()
 		if modulePath == "" {
 			modulePath = "the root module"
 		}
@@ -142,7 +147,7 @@ func (c *ImportCommand) Run(args []string) int {
 		// message.
 		c.Ui.Error(fmt.Sprintf(
 			importCommandMissingResourceFmt,
-			addr, modulePath, addr.Type, addr.Name,
+			addr, modulePath, resourceRelAddr.Type, resourceRelAddr.Name,
 		))
 		return 1
 	}
@@ -154,11 +159,12 @@ func (c *ImportCommand) Run(args []string) int {
 	}
 
 	// Load the backend
-	b, err := c.Backend(&BackendOpts{
-		Config: mod.Config(),
+	b, backendDiags := c.Backend(&BackendOpts{
+		Config: config.Module.Backend,
 	})
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load backend: %s", err))
+	diags = diags.Append(backendDiags)
+	if backendDiags.HasErrors() {
+		c.showDiagnostics(diags)
 		return 1
 	}
 
@@ -174,16 +180,28 @@ func (c *ImportCommand) Run(args []string) int {
 	}
 
 	// Build the operation
-	opReq := c.Operation()
-	opReq.Module = mod
-
-	// Get the context
-	ctx, state, err := local.Context(opReq)
+	opReq := c.Operation(b)
+	opReq.ConfigDir = configPath
+	opReq.ConfigLoader, err = c.initConfigLoader()
 	if err != nil {
-		c.Ui.Error(err.Error())
+		diags = diags.Append(err)
+		c.showDiagnostics(diags)
 		return 1
 	}
+	{
+		var moreDiags tfdiags.Diagnostics
+		opReq.Variables, moreDiags = c.collectVariableValues()
+		diags = diags.Append(moreDiags)
+		if moreDiags.HasErrors() {
+			c.showDiagnostics(diags)
+			return 1
+		}
+	}
 
+	// Get the context
+	ctx, state, ctxDiags := local.Context(opReq)
+
+	// Creating the context can result in a lock, so ensure we release it
 	defer func() {
 		err := opReq.StateLocker.Unlock(nil)
 		if err != nil {
@@ -191,20 +209,25 @@ func (c *ImportCommand) Run(args []string) int {
 		}
 	}()
 
+	diags = diags.Append(ctxDiags)
+	if ctxDiags.HasErrors() {
+		c.showDiagnostics(diags)
+		return 1
+	}
+
 	// Perform the import. Note that as you can see it is possible for this
 	// API to import more than one resource at once. For now, we only allow
 	// one while we stabilize this feature.
-	newState, err := ctx.Import(&terraform.ImportOpts{
+	newState, importDiags := ctx.Import(&terraform.ImportOpts{
 		Targets: []*terraform.ImportTarget{
 			&terraform.ImportTarget{
-				Addr:     args[0],
-				ID:       args[1],
-				Provider: c.Meta.provider,
+				Addr: addr,
+				ID:   args[1],
 			},
 		},
 	})
-	if err != nil {
-		diags = diags.Append(err)
+	diags = diags.Append(importDiags)
+	if diags.HasErrors() {
 		c.showDiagnostics(diags)
 		return 1
 	}
@@ -284,10 +307,6 @@ Options:
 
   -no-color               If specified, output won't contain any color.
 
-  -provider=provider      Specific provider to use for import. This is used for
-                          specifying aliases, such as "aws.eu". Defaults to the
-                          normal provider prefix of the resource being imported.
-
   -state=PATH             Path to the source state file. Defaults to the configured
                           backend, or "terraform.tfstate"
 
@@ -312,22 +331,8 @@ func (c *ImportCommand) Synopsis() string {
 	return "Import existing infrastructure into Terraform"
 }
 
-const importCommandInvalidAddressFmt = `Error: %s
-
-For information on valid syntax, see:
-https://www.terraform.io/docs/internals/resource-addressing.html
-`
-
-const importCommandMissingResourceSpecMsg = `Error: resource address must include a full resource spec
-
-For information on valid syntax, see:
-https://www.terraform.io/docs/internals/resource-addressing.html
-`
-
-const importCommandResourceModeMsg = `Error: resource address must refer to a managed resource.
-
-Data resources cannot be imported.
-`
+const importCommandInvalidAddressReference = `For information on valid syntax, see:
+https://www.terraform.io/docs/internals/resource-addressing.html`
 
 const importCommandMissingResourceFmt = `[reset][bold][red]Error:[reset][bold] resource address %q does not exist in the configuration.[reset]
 

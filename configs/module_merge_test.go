@@ -3,13 +3,14 @@ package configs
 import (
 	"testing"
 
-	"github.com/hashicorp/hcl2/gohcl"
-	"github.com/hashicorp/hcl2/hcl"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/gohcl"
+	"github.com/hashicorp/terraform/addrs"
 	"github.com/zclconf/go-cty/cty"
 )
 
 func TestModuleOverrideVariable(t *testing.T) {
-	mod, diags := testModuleFromDir("test-fixtures/valid-modules/override-variable")
+	mod, diags := testModuleFromDir("testdata/valid-modules/override-variable")
 	assertNoDiagnostics(t, diags)
 	if mod == nil {
 		t.Fatalf("module is nil")
@@ -25,7 +26,7 @@ func TestModuleOverrideVariable(t *testing.T) {
 			Type:           cty.String,
 			ParsingMode:    VariableParseLiteral,
 			DeclRange: hcl.Range{
-				Filename: "test-fixtures/valid-modules/override-variable/primary.tf",
+				Filename: "testdata/valid-modules/override-variable/primary.tf",
 				Start: hcl.Pos{
 					Line:   1,
 					Column: 1,
@@ -46,7 +47,7 @@ func TestModuleOverrideVariable(t *testing.T) {
 			Type:           cty.String,
 			ParsingMode:    VariableParseLiteral,
 			DeclRange: hcl.Range{
-				Filename: "test-fixtures/valid-modules/override-variable/primary.tf",
+				Filename: "testdata/valid-modules/override-variable/primary.tf",
 				Start: hcl.Pos{
 					Line:   7,
 					Column: 1,
@@ -64,7 +65,7 @@ func TestModuleOverrideVariable(t *testing.T) {
 }
 
 func TestModuleOverrideModule(t *testing.T) {
-	mod, diags := testModuleFromDir("test-fixtures/valid-modules/override-module")
+	mod, diags := testModuleFromDir("testdata/valid-modules/override-module")
 	assertNoDiagnostics(t, diags)
 	if mod == nil {
 		t.Fatalf("module is nil")
@@ -82,7 +83,7 @@ func TestModuleOverrideModule(t *testing.T) {
 		Name:       "example",
 		SourceAddr: "./example2-a_override",
 		SourceAddrRange: hcl.Range{
-			Filename: "test-fixtures/valid-modules/override-module/a_override.tf",
+			Filename: "testdata/valid-modules/override-module/a_override.tf",
 			Start: hcl.Pos{
 				Line:   3,
 				Column: 12,
@@ -96,7 +97,7 @@ func TestModuleOverrideModule(t *testing.T) {
 		},
 		SourceSet: true,
 		DeclRange: hcl.Range{
-			Filename: "test-fixtures/valid-modules/override-module/primary.tf",
+			Filename: "testdata/valid-modules/override-module/primary.tf",
 			Start: hcl.Pos{
 				Line:   2,
 				Column: 1,
@@ -135,4 +136,98 @@ func TestModuleOverrideModule(t *testing.T) {
 	}
 
 	assertResultDeepEqual(t, gotArgs, wantArgs)
+}
+
+func TestModuleOverrideDynamic(t *testing.T) {
+	schema := &hcl.BodySchema{
+		Blocks: []hcl.BlockHeaderSchema{
+			{Type: "foo"},
+			{Type: "dynamic", LabelNames: []string{"type"}},
+		},
+	}
+
+	t.Run("base is dynamic", func(t *testing.T) {
+		mod, diags := testModuleFromDir("testdata/valid-modules/override-dynamic-block-base")
+		assertNoDiagnostics(t, diags)
+		if mod == nil {
+			t.Fatalf("module is nil")
+		}
+
+		if _, exists := mod.ManagedResources["test.foo"]; !exists {
+			t.Fatalf("no module 'example'")
+		}
+		if len(mod.ManagedResources) != 1 {
+			t.Fatalf("wrong number of managed resources in result %d; want 1", len(mod.ManagedResources))
+		}
+
+		body := mod.ManagedResources["test.foo"].Config
+		content, diags := body.Content(schema)
+		assertNoDiagnostics(t, diags)
+
+		if len(content.Blocks) != 1 {
+			t.Fatalf("wrong number of blocks in result %d; want 1", len(content.Blocks))
+		}
+		if got, want := content.Blocks[0].Type, "foo"; got != want {
+			t.Fatalf("wrong block type %q; want %q", got, want)
+		}
+	})
+	t.Run("override is dynamic", func(t *testing.T) {
+		mod, diags := testModuleFromDir("testdata/valid-modules/override-dynamic-block-override")
+		assertNoDiagnostics(t, diags)
+		if mod == nil {
+			t.Fatalf("module is nil")
+		}
+
+		if _, exists := mod.ManagedResources["test.foo"]; !exists {
+			t.Fatalf("no module 'example'")
+		}
+		if len(mod.ManagedResources) != 1 {
+			t.Fatalf("wrong number of managed resources in result %d; want 1", len(mod.ManagedResources))
+		}
+
+		body := mod.ManagedResources["test.foo"].Config
+		content, diags := body.Content(schema)
+		assertNoDiagnostics(t, diags)
+
+		if len(content.Blocks) != 1 {
+			t.Fatalf("wrong number of blocks in result %d; want 1", len(content.Blocks))
+		}
+		if got, want := content.Blocks[0].Type, "dynamic"; got != want {
+			t.Fatalf("wrong block type %q; want %q", got, want)
+		}
+		if got, want := content.Blocks[0].Labels[0], "foo"; got != want {
+			t.Fatalf("wrong dynamic block label %q; want %q", got, want)
+		}
+	})
+}
+
+func TestModuleOverrideResourceFQNs(t *testing.T) {
+	mod, diags := testModuleFromDir("testdata/valid-modules/override-resource-provider")
+	assertNoDiagnostics(t, diags)
+
+	got := mod.ManagedResources["test_instance.explicit"]
+	wantProvider := addrs.NewProvider(addrs.DefaultRegistryHost, "bar", "test")
+	wantProviderCfg := &ProviderConfigRef{
+		Name: "bar-test",
+		NameRange: hcl.Range{
+			Filename: "testdata/valid-modules/override-resource-provider/a_override.tf",
+			Start:    hcl.Pos{Line: 2, Column: 14, Byte: 51},
+			End:      hcl.Pos{Line: 2, Column: 22, Byte: 59},
+		},
+	}
+
+	if !got.Provider.Equals(wantProvider) {
+		t.Fatalf("wrong provider %s, want %s", got.Provider, wantProvider)
+	}
+	assertResultDeepEqual(t, got.ProviderConfigRef, wantProviderCfg)
+
+	// now verify that a resource with no provider config falls back to default
+	got = mod.ManagedResources["test_instance.default"]
+	wantProvider = addrs.NewDefaultProvider("test")
+	if !got.Provider.Equals(wantProvider) {
+		t.Fatalf("wrong provider %s, want %s", got.Provider, wantProvider)
+	}
+	if got.ProviderConfigRef != nil {
+		t.Fatalf("wrong result: found provider config ref %s, expected nil", got.ProviderConfigRef)
+	}
 }

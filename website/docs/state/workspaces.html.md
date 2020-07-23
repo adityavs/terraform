@@ -18,7 +18,7 @@ the backend has only one workspace, called "default", and thus there is only
 one Terraform state associated with that configuration.
 
 Certain backends support _multiple_ named workspaces, allowing multiple states
-to be associated with a single configuration. The configuration is still
+to be associated with a single configuration. The configuration still
 has only one backend, but multiple distinct instances of that configuration
 to be deployed without configuring a new backend or changing authentication
 credentials.
@@ -27,15 +27,26 @@ Multiple workspaces are currently supported by the following backends:
 
  * [AzureRM](/docs/backends/types/azurerm.html)
  * [Consul](/docs/backends/types/consul.html)
+ * [COS](/docs/backends/types/cos.html)
  * [GCS](/docs/backends/types/gcs.html)
+ * [Kubernetes](/docs/backends/types/kubernetes.html)
  * [Local](/docs/backends/types/local.html)
  * [Manta](/docs/backends/types/manta.html)
+ * [Postgres](/docs/backends/types/pg.html)
+ * [Remote](/docs/backends/types/remote.html)
  * [S3](/docs/backends/types/s3.html)
 
 In the 0.9 line of Terraform releases, this concept was known as "environment".
 It was renamed in 0.10 based on feedback about confusion caused by the
 overloading of the word "environment" both within Terraform itself and within
 organizations that use Terraform.
+
+-> **Note**: The Terraform CLI workspace concept described in this document is
+different from but related to the Terraform Cloud
+[workspace](/docs/cloud/workspaces/index.html) concept.
+If you use multiple Terraform CLI workspaces in a single Terraform configuration
+and are migrating that configuration to Terraform Cloud, see this [migration
+document](/docs/cloud/migrate/workspaces.html).
 
 ## Using Workspaces
 
@@ -46,7 +57,7 @@ you've only ever worked on the "default" workspace.
 
 Workspaces are managed with the `terraform workspace` set of commands. To
 create a new workspace and switch to it, you can use `terraform workspace new`;
-to switch environments you can use `terraform workspace select`; etc.
+to switch workspaces you can use `terraform workspace select`; etc.
 
 For example, creating a new workspace:
 
@@ -68,7 +79,10 @@ Terraform workspace.
 
 Within your Terraform configuration, you may include the name of the current
 workspace using the `${terraform.workspace}` interpolation sequence. This can
-be used anywhere interpolations are allowed.
+be used anywhere interpolations are allowed. However, it should **not** be
+used in remote operations against Terraform Cloud workspaces. For an
+explanation, see the [remote backend](../backends/types/remote.html#workspaces)
+document.
 
 Referencing the current workspace is useful for changing behavior based
 on the workspace. For example, for non-default workspaces, it may be useful
@@ -87,7 +101,7 @@ tagging behavior:
 
 ```hcl
 resource "aws_instance" "example" {
-  tags {
+  tags = {
     Name = "web - ${terraform.workspace}"
   }
 
@@ -175,7 +189,7 @@ aren't any more complex than that. Terraform wraps this simple notion with
 a set of protections and support for remote state.
 
 For local state, Terraform stores the workspace states in a directory called
-`terraform.tfstate.d`. This directory should be be treated similarly to
+`terraform.tfstate.d`. This directory should be treated similarly to
 local-only `terraform.tfstate`; some teams commit these files to version
 control, although using a remote backend instead is recommended when there are
 multiple collaborators.
@@ -183,7 +197,7 @@ multiple collaborators.
 For [remote state](/docs/state/remote.html), the workspaces are stored
 directly in the configured [backend](/docs/backends). For example, if you
 use [Consul](/docs/backends/types/consul.html), the workspaces are stored
-by appending the environment name to the state path. To ensure that
+by appending the workspace name to the state path. To ensure that
 workspace names are stored correctly and safely in all backends, the name
 must be valid to use in a URL path segment without escaping.
 
@@ -193,4 +207,6 @@ meant to be a shared resource. They aren't a private, local-only notion
 
 The "current workspace" name is stored only locally in the ignored
 `.terraform` directory. This allows multiple team members to work on
-different workspaces concurrently.
+different workspaces concurrently. The "current workspace" name is **not**
+currently meaningful in Terraform Cloud workspaces since it will always
+have the value `default`.

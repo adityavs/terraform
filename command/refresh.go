@@ -4,9 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/backend"
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 )
 
@@ -17,14 +16,10 @@ type RefreshCommand struct {
 }
 
 func (c *RefreshCommand) Run(args []string) int {
-	args, err := c.Meta.process(args, true)
-	if err != nil {
-		return 1
-	}
-
-	cmdFlags := c.Meta.flagSet("refresh")
-	cmdFlags.StringVar(&c.Meta.statePath, "state", DefaultStateFilename, "path")
-	cmdFlags.IntVar(&c.Meta.parallelism, "parallelism", 0, "parallelism")
+	args = c.Meta.process(args)
+	cmdFlags := c.Meta.extendedFlagSet("refresh")
+	cmdFlags.StringVar(&c.Meta.statePath, "state", "", "path")
+	cmdFlags.IntVar(&c.Meta.parallelism, "parallelism", DefaultParallelism, "parallelism")
 	cmdFlags.StringVar(&c.Meta.stateOutPath, "state-out", "", "path")
 	cmdFlags.StringVar(&c.Meta.backupPath, "backup", "", "path")
 	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock state")
@@ -42,54 +37,70 @@ func (c *RefreshCommand) Run(args []string) int {
 
 	var diags tfdiags.Diagnostics
 
-	// Load the module
-	mod, diags := c.Module(configPath)
-	if diags.HasErrors() {
-		c.showDiagnostics(diags)
-		return 1
-	}
-
 	// Check for user-supplied plugin path
 	if c.pluginPath, err = c.loadPluginPath(); err != nil {
 		c.Ui.Error(fmt.Sprintf("Error loading plugin path: %s", err))
 		return 1
 	}
 
-	var conf *config.Config
-	if mod != nil {
-		conf = mod.Config()
+	backendConfig, configDiags := c.loadBackendConfig(configPath)
+	diags = diags.Append(configDiags)
+	if configDiags.HasErrors() {
+		c.showDiagnostics(diags)
+		return 1
 	}
 
 	// Load the backend
-	b, err := c.Backend(&BackendOpts{
-		Config: conf,
+	b, backendDiags := c.Backend(&BackendOpts{
+		Config: backendConfig,
 	})
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load backend: %s", err))
+	diags = diags.Append(backendDiags)
+	if backendDiags.HasErrors() {
+		c.showDiagnostics(diags)
 		return 1
 	}
 
+	// Before we delegate to the backend, we'll print any warning diagnostics
+	// we've accumulated here, since the backend will start fresh with its own
+	// diagnostics.
+	c.showDiagnostics(diags)
+	diags = nil
+
 	// Build the operation
-	opReq := c.Operation()
+	opReq := c.Operation(b)
+	opReq.ConfigDir = configPath
 	opReq.Type = backend.OperationTypeRefresh
-	opReq.Module = mod
+
+	opReq.ConfigLoader, err = c.initConfigLoader()
+	if err != nil {
+		c.showDiagnostics(err)
+		return 1
+	}
+
+	{
+		var moreDiags tfdiags.Diagnostics
+		opReq.Variables, moreDiags = c.collectVariableValues()
+		diags = diags.Append(moreDiags)
+		if moreDiags.HasErrors() {
+			c.showDiagnostics(diags)
+			return 1
+		}
+	}
 
 	op, err := c.RunOperation(b, opReq)
 	if err != nil {
-		diags = diags.Append(err)
-	}
-
-	c.showDiagnostics(diags)
-	if diags.HasErrors() {
+		c.showDiagnostics(err)
 		return 1
 	}
+	if op.Result != backend.OperationSuccess {
+		return op.Result.ExitStatus()
+	}
 
-	// Output the outputs
-	if outputs := outputsAsString(op.State, terraform.RootModulePath, nil, true); outputs != "" {
+	if outputs := outputsAsString(op.State, addrs.RootModuleInstance, true); outputs != "" {
 		c.Ui.Output(c.Colorize().Color(outputs))
 	}
 
-	return 0
+	return op.Result.ExitStatus()
 }
 
 func (c *RefreshCommand) Help() string {
@@ -108,6 +119,10 @@ Options:
   -backup=path        Path to backup the existing state file before
                       modifying. Defaults to the "-state-out" path with
                       ".backup" extension. Set to "-" to disable backup.
+
+  -compact-warnings   If Terraform produces any warnings that are not
+                      accompanied by errors, show them in a more compact form
+                      that includes only the summary messages.
 
   -input=true         Ask for input for variables if not directly set.
 

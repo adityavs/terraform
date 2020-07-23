@@ -15,6 +15,14 @@ type Client interface {
 	Delete() error
 }
 
+// ClientForcePusher is an optional interface that allows a remote
+// state to force push by managing a flag on the client that is
+// toggled on by a call to EnableForcePush.
+type ClientForcePusher interface {
+	Client
+	EnableForcePush()
+}
+
 // ClientLocker is an optional interface that allows a remote state
 // backend to enable state lock/unlock.
 type ClientLocker interface {
@@ -44,9 +52,4 @@ func NewClient(t string, conf map[string]string) (Client, error) {
 
 // BuiltinClients is the list of built-in clients that can be used with
 // NewClient.
-var BuiltinClients = map[string]Factory{
-	"artifactory": artifactoryFactory,
-	"etcd":        etcdFactory,
-	"http":        httpFactory,
-	"local":       fileFactory,
-}
+var BuiltinClients = map[string]Factory{}

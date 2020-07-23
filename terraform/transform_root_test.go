@@ -3,14 +3,16 @@ package terraform
 import (
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/terraform/addrs"
 )
 
 func TestRootTransformer(t *testing.T) {
 	mod := testModule(t, "transform-root-basic")
 
-	g := Graph{Path: RootModulePath}
+	g := Graph{Path: addrs.RootModuleInstance}
 	{
-		tf := &ConfigTransformer{Module: mod}
+		tf := &ConfigTransformer{Config: mod}
 		if err := tf.Transform(&g); err != nil {
 			t.Fatalf("err: %s", err)
 		}
@@ -42,7 +44,7 @@ func TestRootTransformer(t *testing.T) {
 	actual := strings.TrimSpace(g.String())
 	expected := strings.TrimSpace(testTransformRootBasicStr)
 	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
+		t.Fatalf("wrong result\n\ngot:\n%s\n\nwant:\n%s", actual, expected)
 	}
 
 	root, err := g.Root()
@@ -56,11 +58,11 @@ func TestRootTransformer(t *testing.T) {
 
 const testTransformRootBasicStr = `
 aws_instance.foo
-  provider.aws
+  provider["registry.terraform.io/hashicorp/aws"]
 do_droplet.bar
-  provider.do
-provider.aws
-provider.do
+  provider["registry.terraform.io/hashicorp/do"]
+provider["registry.terraform.io/hashicorp/aws"]
+provider["registry.terraform.io/hashicorp/do"]
 root
   aws_instance.foo
   do_droplet.bar

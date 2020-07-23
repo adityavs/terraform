@@ -12,7 +12,7 @@ import (
 	"github.com/mitchellh/cli"
 )
 
-func TestFmt_errorReporting(t *testing.T) {
+func TestFmt_nonexist(t *testing.T) {
 	tempDir := fmtFixtureWriteDir(t)
 
 	ui := new(cli.MockUi)
@@ -23,15 +23,81 @@ func TestFmt_errorReporting(t *testing.T) {
 		},
 	}
 
-	dummy_file := filepath.Join(tempDir, "doesnotexist")
-	args := []string{dummy_file}
+	missingDir := filepath.Join(tempDir, "doesnotexist")
+	args := []string{missingDir}
 	if code := c.Run(args); code != 2 {
 		t.Fatalf("wrong exit code. errors: \n%s", ui.ErrorWriter.String())
 	}
 
-	expected := fmt.Sprintf("Error running fmt: stat %s: no such file or directory", dummy_file)
+	expected := "No file or directory at"
 	if actual := ui.ErrorWriter.String(); !strings.Contains(actual, expected) {
 		t.Fatalf("expected:\n%s\n\nto include: %q", actual, expected)
+	}
+}
+
+func TestFmt_syntaxError(t *testing.T) {
+	tempDir := testTempDir(t)
+
+	invalidSrc := `
+a = 1 +
+`
+
+	err := ioutil.WriteFile(filepath.Join(tempDir, "invalid.tf"), []byte(invalidSrc), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ui := new(cli.MockUi)
+	c := &FmtCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	args := []string{tempDir}
+	if code := c.Run(args); code != 2 {
+		t.Fatalf("wrong exit code. errors: \n%s", ui.ErrorWriter.String())
+	}
+
+	expected := "Invalid expression"
+	if actual := ui.ErrorWriter.String(); !strings.Contains(actual, expected) {
+		t.Fatalf("expected:\n%s\n\nto include: %q", actual, expected)
+	}
+}
+
+func TestFmt_snippetInError(t *testing.T) {
+	tempDir := testTempDir(t)
+
+	backendSrc := `terraform {backend "s3" {}}`
+
+	err := ioutil.WriteFile(filepath.Join(tempDir, "backend.tf"), []byte(backendSrc), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ui := new(cli.MockUi)
+	c := &FmtCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	args := []string{tempDir}
+	if code := c.Run(args); code != 2 {
+		t.Fatalf("wrong exit code. errors: \n%s", ui.ErrorWriter.String())
+	}
+
+	substrings := []string{
+		"Argument definition required",
+		"line 1, in terraform",
+		`1: terraform {backend "s3" {}}`,
+	}
+	for _, substring := range substrings {
+		if actual := ui.ErrorWriter.String(); !strings.Contains(actual, substring) {
+			t.Errorf("expected:\n%s\n\nto include: %q", actual, substring)
+		}
 	}
 }
 
@@ -106,9 +172,41 @@ func TestFmt_directoryArg(t *testing.T) {
 		t.Fatalf("wrong exit code. errors: \n%s", ui.ErrorWriter.String())
 	}
 
-	expected := fmt.Sprintf("%s\n", filepath.Join(tempDir, fmtFixture.filename))
-	if actual := ui.OutputWriter.String(); actual != expected {
-		t.Fatalf("got: %q\nexpected: %q", actual, expected)
+	got, err := filepath.Abs(strings.TrimSpace(ui.OutputWriter.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(tempDir, fmtFixture.filename)
+
+	if got != want {
+		t.Fatalf("wrong output\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+func TestFmt_fileArg(t *testing.T) {
+	tempDir := fmtFixtureWriteDir(t)
+
+	ui := new(cli.MockUi)
+	c := &FmtCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	args := []string{filepath.Join(tempDir, fmtFixture.filename)}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("wrong exit code. errors: \n%s", ui.ErrorWriter.String())
+	}
+
+	got, err := filepath.Abs(strings.TrimSpace(ui.OutputWriter.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(tempDir, fmtFixture.filename)
+
+	if got != want {
+		t.Fatalf("wrong output\ngot:  %s\nwant: %s", got, want)
 	}
 }
 
@@ -181,6 +279,10 @@ func TestFmt_check(t *testing.T) {
 	if code := c.Run(args); code != 3 {
 		t.Fatalf("wrong exit code. expected 3")
 	}
+
+	// Given that we give relative paths back to the user, normalize this temp
+	// dir so that we're comparing against a relative-ized (normalized) path
+	tempDir = c.normalizePath(tempDir)
 
 	if actual := ui.OutputWriter.String(); !strings.Contains(actual, tempDir) {
 		t.Fatalf("expected:\n%s\n\nto include: %q", actual, tempDir)

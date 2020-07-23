@@ -5,28 +5,32 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/terraform/helper/copy"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/mitchellh/cli"
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/addrs"
+	backendinit "github.com/hashicorp/terraform/backend/init"
+	"github.com/hashicorp/terraform/configs/configschema"
+	"github.com/hashicorp/terraform/helper/copy"
+	"github.com/hashicorp/terraform/plans"
+	"github.com/hashicorp/terraform/providers"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/terraform"
 )
 
 func TestPlan(t *testing.T) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if err := os.Chdir(testFixturePath("plan")); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Chdir(cwd)
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -42,24 +46,18 @@ func TestPlan(t *testing.T) {
 }
 
 func TestPlan_lockedState(t *testing.T) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
-	testPath := testFixturePath("plan")
-	unlock, err := testLockState("./testdata", filepath.Join(testPath, DefaultStateFilename))
+	unlock, err := testLockState(testDataDir, filepath.Join(td, DefaultStateFilename))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unlock()
 
-	if err := os.Chdir(testPath); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Chdir(cwd)
-
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -83,9 +81,7 @@ func TestPlan_plan(t *testing.T) {
 	tmp, cwd := testCwd(t)
 	defer testFixCwd(t, tmp, cwd)
 
-	planPath := testPlanFile(t, &terraform.Plan{
-		Module: testModule(t, "apply"),
-	})
+	planPath := testPlanFileNoop(t)
 
 	p := testProvider()
 	ui := new(cli.MockUi)
@@ -97,36 +93,37 @@ func TestPlan_plan(t *testing.T) {
 	}
 
 	args := []string{planPath}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	if code := c.Run(args); code != 1 {
+		t.Fatalf("wrong exit status %d; want 1\nstderr: %s", code, ui.ErrorWriter.String())
 	}
 
-	if p.RefreshCalled {
-		t.Fatal("refresh should not be called")
+	if p.ReadResourceCalled {
+		t.Fatal("ReadResource should not have been called")
 	}
 }
 
 func TestPlan_destroy(t *testing.T) {
-	originalState := &terraform.State{
-		Modules: []*terraform.ModuleState{
-			&terraform.ModuleState{
-				Path: []string{"root"},
-				Resources: map[string]*terraform.ResourceState{
-					"test_instance.foo": &terraform.ResourceState{
-						Type: "test_instance",
-						Primary: &terraform.InstanceState{
-							ID: "bar",
-						},
-					},
-				},
+	originalState := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(
+			addrs.Resource{
+				Mode: addrs.ManagedResourceMode,
+				Type: "test_instance",
+				Name: "foo",
+			}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+			&states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"id":"bar"}`),
+				Status:    states.ObjectReady,
 			},
-		},
-	}
-
+			addrs.AbsProviderConfig{
+				Provider: addrs.NewDefaultProvider("test"),
+				Module:   addrs.RootModule,
+			},
+		)
+	})
 	outPath := testTempFile(t)
 	statePath := testStateFile(t, originalState)
 
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -145,16 +142,14 @@ func TestPlan_destroy(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	if !p.RefreshCalled {
-		t.Fatal("refresh should be called")
+	if !p.ReadResourceCalled {
+		t.Fatal("ReadResource should have been called")
 	}
 
 	plan := testReadPlan(t, outPath)
-	for _, m := range plan.Diff.Modules {
-		for _, r := range m.Resources {
-			if !r.Destroy {
-				t.Fatalf("bad: %#v", r)
-			}
+	for _, rc := range plan.Changes.Resources {
+		if got, want := rc.Action, plans.Delete; got != want {
+			t.Fatalf("wrong action %s for %s; want %s\nplanned change: %s", got, rc.Addr, want, spew.Sdump(rc))
 		}
 	}
 }
@@ -163,7 +158,7 @@ func TestPlan_noState(t *testing.T) {
 	tmp, cwd := testCwd(t)
 	defer testFixCwd(t, tmp, cwd)
 
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -180,15 +175,15 @@ func TestPlan_noState(t *testing.T) {
 	}
 
 	// Verify that refresh was called
-	if p.RefreshCalled {
-		t.Fatal("refresh should not be called")
+	if p.ReadResourceCalled {
+		t.Fatal("ReadResource should not be called")
 	}
 
 	// Verify that the provider was called with the existing state
-	actual := strings.TrimSpace(p.DiffState.String())
-	expected := strings.TrimSpace(testPlanNoStateStr)
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
+	actual := p.PlanResourceChangeRequest.PriorState
+	expected := cty.NullVal(p.GetSchemaReturn.ResourceTypes["test_instance"].ImpliedType())
+	if !expected.RawEquals(actual) {
+		t.Fatalf("wrong prior state\ngot:  %#v\nwant: %#v", actual, expected)
 	}
 }
 
@@ -199,7 +194,7 @@ func TestPlan_outPath(t *testing.T) {
 	td := testTempDir(t)
 	outPath := filepath.Join(td, "test.plan")
 
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -208,8 +203,8 @@ func TestPlan_outPath(t *testing.T) {
 		},
 	}
 
-	p.DiffReturn = &terraform.InstanceDiff{
-		Destroy: true,
+	p.PlanResourceChangeResponse = providers.PlanResourceChangeResponse{
+		PlannedState: cty.NullVal(cty.EmptyObject),
 	}
 
 	args := []string{
@@ -220,39 +215,36 @@ func TestPlan_outPath(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	f, err := os.Open(outPath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer f.Close()
-
-	if _, err := terraform.ReadPlan(f); err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	testReadPlan(t, outPath) // will call t.Fatal itself if the file cannot be read
 }
 
 func TestPlan_outPathNoChange(t *testing.T) {
-	originalState := &terraform.State{
-		Modules: []*terraform.ModuleState{
-			&terraform.ModuleState{
-				Path: []string{"root"},
-				Resources: map[string]*terraform.ResourceState{
-					"test_instance.foo": &terraform.ResourceState{
-						Type: "test_instance",
-						Primary: &terraform.InstanceState{
-							ID: "bar",
-						},
-					},
-				},
+	originalState := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(
+			addrs.Resource{
+				Mode: addrs.ManagedResourceMode,
+				Type: "test_instance",
+				Name: "foo",
+			}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+			&states.ResourceInstanceObjectSrc{
+				// Aside from "id" (which is computed) the values here must
+				// exactly match the values in the "plan" test fixture in order
+				// to produce the empty plan we need for this test.
+				AttrsJSON: []byte(`{"id":"bar","ami":"bar","network_interface":[{"description":"Main network interface","device_index":"0"}]}`),
+				Status:    states.ObjectReady,
 			},
-		},
-	}
+			addrs.AbsProviderConfig{
+				Provider: addrs.NewDefaultProvider("test"),
+				Module:   addrs.RootModule,
+			},
+		)
+	})
 	statePath := testStateFile(t, originalState)
 
 	td := testTempDir(t)
 	outPath := filepath.Join(td, "test.plan")
 
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -271,8 +263,8 @@ func TestPlan_outPathNoChange(t *testing.T) {
 	}
 
 	plan := testReadPlan(t, outPath)
-	if !plan.Diff.Empty() {
-		t.Fatalf("Expected empty plan to be written to plan file, got: %s", plan)
+	if !plan.Changes.Empty() {
+		t.Fatalf("Expected empty plan to be written to plan file, got: %s", spew.Sdump(plan))
 	}
 }
 
@@ -284,23 +276,23 @@ func TestPlan_outBackend(t *testing.T) {
 	defer os.RemoveAll(td)
 	defer testChdir(t, td)()
 
-	// Our state
-	originalState := &terraform.State{
-		Modules: []*terraform.ModuleState{
-			&terraform.ModuleState{
-				Path: []string{"root"},
-				Resources: map[string]*terraform.ResourceState{
-					"test_instance.foo": &terraform.ResourceState{
-						Type: "test_instance",
-						Primary: &terraform.InstanceState{
-							ID: "bar",
-						},
-					},
-				},
+	originalState := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(
+			addrs.Resource{
+				Mode: addrs.ManagedResourceMode,
+				Type: "test_instance",
+				Name: "foo",
+			}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+			&states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"id":"bar","ami":"bar"}`),
+				Status:    states.ObjectReady,
 			},
-		},
-	}
-	originalState.Init()
+			addrs.AbsProviderConfig{
+				Provider: addrs.NewDefaultProvider("test"),
+				Module:   addrs.RootModule,
+			},
+		)
+	})
 
 	// Setup our backend state
 	dataState, srv := testBackendState(t, originalState, 200)
@@ -309,71 +301,28 @@ func TestPlan_outBackend(t *testing.T) {
 
 	outPath := "foo"
 	p := testProvider()
-	ui := new(cli.MockUi)
-	c := &PlanCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
-		},
-	}
-
-	args := []string{
-		"-out", outPath,
-	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
-	}
-
-	plan := testReadPlan(t, outPath)
-	if !plan.Diff.Empty() {
-		t.Fatalf("Expected empty plan to be written to plan file, got: %s", plan)
-	}
-
-	if plan.Backend.Empty() {
-		t.Fatal("should have backend info")
-	}
-	if !reflect.DeepEqual(plan.Backend, dataState.Backend) {
-		t.Fatalf("bad: %#v", plan.Backend)
-	}
-}
-
-// When using "-out" with a legacy remote state, the plan should encode
-// the backend config
-func TestPlan_outBackendLegacy(t *testing.T) {
-	// Create a temporary working directory that is empty
-	td := tempDir(t)
-	copy.CopyDir(testFixturePath("plan-out-backend-legacy"), td)
-	defer os.RemoveAll(td)
-	defer testChdir(t, td)()
-
-	// Our state
-	originalState := &terraform.State{
-		Modules: []*terraform.ModuleState{
-			&terraform.ModuleState{
-				Path: []string{"root"},
-				Resources: map[string]*terraform.ResourceState{
-					"test_instance.foo": &terraform.ResourceState{
-						Type: "test_instance",
-						Primary: &terraform.InstanceState{
-							ID: "bar",
-						},
+	p.GetSchemaReturn = &terraform.ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"id": {
+						Type:     cty.String,
+						Computed: true,
+					},
+					"ami": {
+						Type:     cty.String,
+						Optional: true,
 					},
 				},
 			},
 		},
 	}
-	originalState.Init()
-
-	// Setup our legacy state
-	remoteState, srv := testRemoteState(t, originalState, 200)
-	defer srv.Close()
-	dataState := terraform.NewState()
-	dataState.Remote = remoteState
-	testStateFileRemote(t, dataState)
-
-	outPath := "foo"
-	p := testProvider()
-	ui := new(cli.MockUi)
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
+		return providers.PlanResourceChangeResponse{
+			PlannedState: req.ProposedNewState,
+		}
+	}
+	ui := cli.NewMockUi()
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
@@ -385,24 +334,43 @@ func TestPlan_outBackendLegacy(t *testing.T) {
 		"-out", outPath,
 	}
 	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+		t.Logf("stdout: %s", ui.OutputWriter.String())
+		t.Fatalf("plan command failed with exit code %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
 	plan := testReadPlan(t, outPath)
-	if !plan.Diff.Empty() {
-		t.Fatalf("Expected empty plan to be written to plan file, got: %s", plan)
+	if !plan.Changes.Empty() {
+		t.Fatalf("Expected empty plan to be written to plan file, got: %s", spew.Sdump(plan))
 	}
 
-	if plan.State.Remote.Empty() {
-		t.Fatal("should have remote info")
+	if got, want := plan.Backend.Type, "http"; got != want {
+		t.Errorf("wrong backend type %q; want %q", got, want)
+	}
+	if got, want := plan.Backend.Workspace, "default"; got != want {
+		t.Errorf("wrong backend workspace %q; want %q", got, want)
+	}
+	{
+		httpBackend := backendinit.Backend("http")()
+		schema := httpBackend.ConfigSchema()
+		got, err := plan.Backend.Config.Decode(schema.ImpliedType())
+		if err != nil {
+			t.Fatalf("failed to decode backend config in plan: %s", err)
+		}
+		want, err := dataState.Backend.Config(schema)
+		if err != nil {
+			t.Fatalf("failed to decode cached config: %s", err)
+		}
+		if !want.RawEquals(got) {
+			t.Errorf("wrong backend config\ngot:  %#v\nwant: %#v", got, want)
+		}
 	}
 }
 
-func TestPlan_refresh(t *testing.T) {
+func TestPlan_refreshFalse(t *testing.T) {
 	tmp, cwd := testCwd(t)
 	defer testFixCwd(t, tmp, cwd)
 
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -419,8 +387,8 @@ func TestPlan_refresh(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	if p.RefreshCalled {
-		t.Fatal("refresh should not be called")
+	if p.ReadResourceCalled {
+		t.Fatal("ReadResource should not have been called")
 	}
 }
 
@@ -428,7 +396,7 @@ func TestPlan_state(t *testing.T) {
 	originalState := testState()
 	statePath := testStateFile(t, originalState)
 
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -446,10 +414,17 @@ func TestPlan_state(t *testing.T) {
 	}
 
 	// Verify that the provider was called with the existing state
-	actual := strings.TrimSpace(p.DiffState.String())
-	expected := strings.TrimSpace(testPlanStateStr)
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
+	actual := p.PlanResourceChangeRequest.PriorState
+	expected := cty.ObjectVal(map[string]cty.Value{
+		"id":  cty.StringVal("bar"),
+		"ami": cty.NullVal(cty.String),
+		"network_interface": cty.NullVal(cty.List(cty.Object(map[string]cty.Type{
+			"device_index": cty.String,
+			"description":  cty.String,
+		}))),
+	})
+	if !expected.RawEquals(actual) {
+		t.Fatalf("wrong prior state\ngot:  %#v\nwant: %#v", actual, expected)
 	}
 }
 
@@ -467,7 +442,7 @@ func TestPlan_stateDefault(t *testing.T) {
 	}
 	defer os.Chdir(cwd)
 
-	p := testProvider()
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -485,74 +460,17 @@ func TestPlan_stateDefault(t *testing.T) {
 	}
 
 	// Verify that the provider was called with the existing state
-	actual := strings.TrimSpace(p.DiffState.String())
-	expected := strings.TrimSpace(testPlanStateDefaultStr)
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
-	}
-}
-
-func TestPlan_stateFuture(t *testing.T) {
-	originalState := testState()
-	originalState.TFVersion = "99.99.99"
-	statePath := testStateFile(t, originalState)
-
-	p := testProvider()
-	ui := new(cli.MockUi)
-	c := &PlanCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
-		},
-	}
-
-	args := []string{
-		"-state", statePath,
-		testFixturePath("plan"),
-	}
-	if code := c.Run(args); code == 0 {
-		t.Fatal("should fail")
-	}
-
-	f, err := os.Open(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	newState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	if !newState.Equal(originalState) {
-		t.Fatalf("bad: %#v", newState)
-	}
-	if newState.TFVersion != originalState.TFVersion {
-		t.Fatalf("bad: %#v", newState)
-	}
-}
-
-func TestPlan_statePast(t *testing.T) {
-	originalState := testState()
-	originalState.TFVersion = "0.1.0"
-	statePath := testStateFile(t, originalState)
-
-	p := testProvider()
-	ui := new(cli.MockUi)
-	c := &PlanCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
-		},
-	}
-
-	args := []string{
-		"-state", statePath,
-		testFixturePath("plan"),
-	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	actual := p.PlanResourceChangeRequest.PriorState
+	expected := cty.ObjectVal(map[string]cty.Value{
+		"id":  cty.StringVal("bar"),
+		"ami": cty.NullVal(cty.String),
+		"network_interface": cty.NullVal(cty.List(cty.Object(map[string]cty.Type{
+			"device_index": cty.String,
+			"description":  cty.String,
+		}))),
+	})
+	if !expected.RawEquals(actual) {
+		t.Fatalf("wrong prior state\ngot:  %#v\nwant: %#v", actual, expected)
 	}
 }
 
@@ -561,16 +479,26 @@ func TestPlan_validate(t *testing.T) {
 	test = false
 	defer func() { test = true }()
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if err := os.Chdir(testFixturePath("plan-invalid")); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Chdir(cwd)
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("plan-invalid"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	p := testProvider()
+	p.GetSchemaReturn = &terraform.ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"id": {Type: cty.String, Optional: true, Computed: true},
+				},
+			},
+		},
+	}
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
+		return providers.PlanResourceChangeResponse{
+			PlannedState: req.ProposedNewState,
+		}
+	}
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -585,8 +513,8 @@ func TestPlan_validate(t *testing.T) {
 	}
 
 	actual := ui.ErrorWriter.String()
-	if !strings.Contains(actual, "cannot be computed") {
-		t.Fatalf("bad: %s", actual)
+	if want := "Error: Invalid count argument"; !strings.Contains(actual, want) {
+		t.Fatalf("unexpected error output\ngot:\n%s\n\nshould contain: %s", actual, want)
 	}
 }
 
@@ -594,7 +522,7 @@ func TestPlan_vars(t *testing.T) {
 	tmp, cwd := testCwd(t)
 	defer testFixCwd(t, tmp, cwd)
 
-	p := testProvider()
+	p := planVarsFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -636,9 +564,13 @@ func TestPlan_varsUnset(t *testing.T) {
 	test = false
 	defer func() { test = true }()
 
+	// The plan command will prompt for interactive input of var.foo.
+	// We'll answer "bar" to that prompt, which should then allow this
+	// configuration to apply even though var.foo doesn't have a
+	// default value and there are no -var arguments on our command line.
 	defaultInputReader = bytes.NewBufferString("bar\n")
 
-	p := testProvider()
+	p := planVarsFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -664,7 +596,7 @@ func TestPlan_varFile(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	p := testProvider()
+	p := planVarsFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -714,7 +646,7 @@ func TestPlan_varFileDefault(t *testing.T) {
 	}
 	defer os.Chdir(cwd)
 
-	p := testProvider()
+	p := planVarsFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -747,17 +679,45 @@ func TestPlan_varFileDefault(t *testing.T) {
 	}
 }
 
-func TestPlan_detailedExitcode(t *testing.T) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if err := os.Chdir(testFixturePath("plan")); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Chdir(cwd)
+func TestPlan_varFileWithDecls(t *testing.T) {
+	tmp, cwd := testCwd(t)
+	defer testFixCwd(t, tmp, cwd)
 
-	p := testProvider()
+	varFilePath := testTempFile(t)
+	if err := ioutil.WriteFile(varFilePath, []byte(planVarFileWithDecl), 0644); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	p := planVarsFixtureProvider()
+	ui := cli.NewMockUi()
+	c := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
+		},
+	}
+
+	args := []string{
+		"-var-file", varFilePath,
+		testFixturePath("plan-vars"),
+	}
+	if code := c.Run(args); code == 0 {
+		t.Fatalf("succeeded; want failure\n\n%s", ui.OutputWriter.String())
+	}
+
+	msg := ui.ErrorWriter.String()
+	if got, want := msg, "Variable declaration in .tfvars file"; !strings.Contains(got, want) {
+		t.Fatalf("missing expected error message\nwant message containing %q\ngot:\n%s", want, got)
+	}
+}
+
+func TestPlan_detailedExitcode(t *testing.T) {
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	p := planFixtureProvider()
 	ui := new(cli.MockUi)
 	c := &PlanCommand{
 		Meta: Meta{
@@ -773,14 +733,10 @@ func TestPlan_detailedExitcode(t *testing.T) {
 }
 
 func TestPlan_detailedExitcode_emptyDiff(t *testing.T) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if err := os.Chdir(testFixturePath("plan-emptydiff")); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Chdir(cwd)
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("plan-emptydiff"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	p := testProvider()
 	ui := new(cli.MockUi)
@@ -828,7 +784,7 @@ func TestPlan_shutdown(t *testing.T) {
 		})
 
 		// Because of the internal lock in the MockProvider, we can't
-		// coordiante directly with the calling of Stop, and making the
+		// coordinate directly with the calling of Stop, and making the
 		// MockProvider concurrent is disruptive to a lot of existing tests.
 		// Wait here a moment to help make sure the main goroutine gets to the
 		// Stop call before we exit, or the plan may finish before it can be
@@ -843,22 +799,145 @@ func TestPlan_shutdown(t *testing.T) {
 			},
 		}, nil
 	}
+	p.GetSchemaReturn = &terraform.ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"ami": {Type: cty.String, Optional: true},
+				},
+			},
+		},
+	}
 
-	if code := c.Run([]string{testFixturePath("apply-shutdown")}); code != 1 {
-		// FIXME: we should be able to avoid the error during evaluation
-		// the early exit isn't caught before the interpolation is evaluated
-		t.Fatal(ui.OutputWriter.String())
+	code := c.Run([]string{
+		// Unfortunately it seems like this test can inadvertently pick up
+		// leftover state from other tests without this. Ideally we should
+		// find which test is leaving a terraform.tfstate behind and stop it
+		// doing that, but this will stop this test flapping for now.
+		"-state=nonexistent.tfstate",
+		testFixturePath("apply-shutdown"),
+	})
+	if code != 0 {
+		// FIXME: In retrospect cancellation ought to be an unsuccessful exit
+		// case, but we need to do that cautiously in case it impacts automation
+		// wrappers. See the note about this in the terraform.stopHook
+		// implementation for more.
+		t.Errorf("wrong exit code %d; want 0\noutput:\n%s", code, ui.OutputWriter.String())
 	}
 
 	select {
 	case <-cancelled:
 	default:
-		t.Fatal("command not cancelled")
+		t.Error("command not cancelled")
 	}
+}
+
+func TestPlan_init_required(t *testing.T) {
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	ui := new(cli.MockUi)
+	c := &PlanCommand{
+		Meta: Meta{
+			// Running plan without setting testingOverrides is similar to plan without init
+			Ui: ui,
+		},
+	}
+
+	args := []string{}
+	if code := c.Run(args); code != 1 {
+		t.Fatalf("expected error, got success")
+	}
+	output := ui.ErrorWriter.String()
+	if !strings.Contains(output, `Plugin reinitialization required. Please run "terraform init".`) {
+		t.Fatal("wrong error message in output:", output)
+	}
+}
+
+// planFixtureSchema returns a schema suitable for processing the
+// configuration in testdata/plan . This schema should be
+// assigned to a mock provider named "test".
+func planFixtureSchema() *terraform.ProviderSchema {
+	return &terraform.ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"id":  {Type: cty.String, Optional: true, Computed: true},
+					"ami": {Type: cty.String, Optional: true},
+				},
+				BlockTypes: map[string]*configschema.NestedBlock{
+					"network_interface": {
+						Nesting: configschema.NestingList,
+						Block: configschema.Block{
+							Attributes: map[string]*configschema.Attribute{
+								"device_index": {Type: cty.String, Optional: true},
+								"description":  {Type: cty.String, Optional: true},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// planFixtureProvider returns a mock provider that is configured for basic
+// operation with the configuration in testdata/plan. This mock has
+// GetSchemaReturn and PlanResourceChangeFn populated, with the plan
+// step just passing through the new object proposed by Terraform Core.
+func planFixtureProvider() *terraform.MockProvider {
+	p := testProvider()
+	p.GetSchemaReturn = planFixtureSchema()
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
+		return providers.PlanResourceChangeResponse{
+			PlannedState: req.ProposedNewState,
+		}
+	}
+	return p
+}
+
+// planVarsFixtureSchema returns a schema suitable for processing the
+// configuration in testdata/plan-vars . This schema should be
+// assigned to a mock provider named "test".
+func planVarsFixtureSchema() *terraform.ProviderSchema {
+	return &terraform.ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"id":    {Type: cty.String, Optional: true, Computed: true},
+					"value": {Type: cty.String, Optional: true},
+				},
+			},
+		},
+	}
+}
+
+// planVarsFixtureProvider returns a mock provider that is configured for basic
+// operation with the configuration in testdata/plan-vars. This mock has
+// GetSchemaReturn and PlanResourceChangeFn populated, with the plan
+// step just passing through the new object proposed by Terraform Core.
+func planVarsFixtureProvider() *terraform.MockProvider {
+	p := testProvider()
+	p.GetSchemaReturn = planVarsFixtureSchema()
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
+		return providers.PlanResourceChangeResponse{
+			PlannedState: req.ProposedNewState,
+		}
+	}
+	return p
 }
 
 const planVarFile = `
 foo = "bar"
+`
+
+const planVarFileWithDecl = `
+foo = "bar"
+
+variable "nope" {
+}
 `
 
 const testPlanNoStateStr = `

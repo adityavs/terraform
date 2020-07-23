@@ -18,6 +18,7 @@ Below, we show a complete example configuring the "consul" backend:
 terraform {
   backend "consul" {
     address = "demo.consul.io"
+    scheme  = "https"
     path    = "example_app/terraform_state"
   }
 }
@@ -62,12 +63,12 @@ There are several ways to supply the remaining arguments:
     values, unless interactive input is disabled. Terraform will not prompt for
     optional values.
 
-  * **File**: A configuration file may be specified via the `init` command line.
-    To specify a file, use the `-backend-config=PATH` option when running
-    `terraform init`. If the file contains secrets it may be kept in
-    a secure data store, such as
-    [Vault](https://www.vaultproject.io/), in which case it must be downloaded
-    to the local disk before running Terraform.
+  * **File**: A [backend configuration file](#backend-configuration-file) may be specified via the
+    `init` command line. To specify a file, use the `-backend-config=PATH`
+    option when running `terraform init`. If the file contains secrets it may be
+    kept in a secure data store, such as [Vault](https://www.vaultproject.io/),
+    in which case it must be downloaded to the local disk before running
+    Terraform.
 
   * **Command-line key/value pairs**: Key/value pairs can be specified via the
     `init` command line. Note that many shells retain command-line flags in a
@@ -95,6 +96,7 @@ terraform {
 }
 ```
 
+## Backend Configuration File
 A backend configuration file has the contents of the `backend` block as
 top-level attributes, without the need to wrap it in another `terraform`
 or `backend` block:
@@ -102,6 +104,7 @@ or `backend` block:
 ```hcl
 address = "demo.consul.io"
 path    = "example_app/terraform_state"
+scheme  = "https"
 ```
 
 The same settings can alternatively be specified on the command line as
@@ -110,7 +113,8 @@ follows:
 ```
 $ terraform init \
     -backend-config="address=demo.consul.io" \
-    -backend-config="path=example_app/terraform_state"
+    -backend-config="path=example_app/terraform_state" \
+    -backend-config="scheme=https"
 ```
 
 ## Changing Configuration
